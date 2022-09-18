@@ -1,0 +1,570 @@
+---
+title: "Groundwater Chemistry QA Check"
+author: "OWRB"
+date: "11/17/2021"
+output: html_document
+runtime: shiny
+---
+
+<!--
+This script is a r shiny QA script that can be used to QA public awqms data or new groundwater level and chemistry data before import into AWQMS by comparing the results to the historic results for a given aquifer and completing basic other checks. It was written by Zachary Tomlinson at the Oklahoma Water Resources Board. 
+
+Please direct any questions to Zachary.Tomlinson@owrb.ok.gov
+-->
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, comment = FALSE, message = FALSE )
+```
+
+This tool is used to QA large quantities of GMAP chemistry and water level data by automatically flagging data that could have outliers and letting the user look at site/aquifer histories for suspicious points.
+
+To start, select a QA method (existing AWQMS or new data) and an aquifer. This will retrieve existing data for the aquifer and, if new data is selected, prompt you to enter pertinent field information. 
+
+Once that data has been uploaded, you may select a parameter and a statistic (or multiple statistics) for flagging potential outliers for that given parameter. These include data that lies in the outer 1% of the data distribution, data points that are more than 3 standard deviations from the mean, and data points that are fall outside the range of 1.5 * IQR. The default operator to combine statistics is ***And***, meaning that a given data point must meet all of selected statistics for it to be flagged. Switching to the ***Or*** operator flags any data point that meets any of the selected statistics. Therefore, ***Or*** flags more points than ***And***.
+
+Once you have chosen your statistics to flag data, all of the flagged points will show up in the table on the left. A menu will also appear called ***Flagged Site Number***. This pulls up all of the data for a given site which contains some flagged measurements. Each site in the flagged site number menu will pull up a different graph with all of the data in that site. Flagged data points show up as orange, while non-flagged points show up as blue on the graph. You can zoom into the graph to get a better sense of the system and which points you may want to look at in more detail. The included box plot shows all results for the aquifer. 
+
+If a point is deemed an outlier due to a clear fixable mistake, you may navigate to the editable data tab, use the search feature to look up the erronous point, and make any necessary corrections. Any correction should be accompanied by a comment in the included result_comments field. Once all edits have been made, a csv file can be made of all data with all original fields, which can be imported or re-imported into AWQMS.
+
+
+```{r preprocess, echo = FALSE}
+library(lubridate)
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(skimr)
+library(data.table)
+library(shinyWidgets)
+library(lubridate)
+library(DT)
+library(plotly)
+library(dataRetrieval)
+
+source("S:/Groundwater/Chris/R/Lakes/LakesfromLaptop/OKAWQMSWeb.R")
+source("AWQMS_processing_functions.R")
+
+# Read site/aquifer info into awqms
+sites=readOKAWQMS(type="sites",OrganizationIdentifiersCsv="OWRB-GMAP")
+
+# Make a list of parameters to pull out, currently missing nitrate + nitrite
+params = c("Phosphorus",
+  "Total dissolved solids","Depth, from ground surface to well water level",
+  "Ammonia","Alkalinity, total","Bromide","Specific conductance","Chloride",
+  "Sulfate","Total hardness","Zinc","Vanadium","Sodium","Silver",
+  "Selenium","Potassium","Nickel","Molybdenum","Mercury","Manganese",
+  "Magnesium","Lead","Iron","Copper","Cobalt","Chromium",
+  "Calcium","Cadmium","Boron","Beryllium","Barium",
+  "Arsenic","Antimony","Aluminum","Dissolved oxygen (DO)",
+  "pH","Temperature, water", "Fluoride", "Uranium", "Oxidation reduction potential (ORP)"
+)
+
+#Make a list of aquifers
+aqfrs = unique(sites$WatershedManagementUnit)
+```
+
+
+```{r, message=FALSE, comment=FALSE, echo = FALSE}
+ui = fluidPage(fluidRow(
+  # Choose aquifer, qa type (new data or existing data), and add button to initialize data retrieval
+  column(4, selectInput('selected_aqfr', "Aquifer:", choices = aqfrs),
+         selectInput('qa_type', "Type of QA:", choices = c("AWQMS data only", 
+        "New data for import")), actionButton("retrieve", "Retreive Data")), 
+  
+  # Make a conditional panel to prompt user to input survey and lab files for import if new data is chosen
+  column(4, conditionalPanel(
+    condition = "input.qa_type == 'New data for import'",
+    fileInput("lab_data", "Choose CSV file(s) of lab data",
+      multiple = TRUE,accept = ".csv"), 
+      fileInput("field_data", "Choose CSV file(s) of survey data",
+        multiple = TRUE,accept = ".csv"))),
+  
+  # Give user choice of operator to flag statistics by (or or and) along with download buttons
+  column(4, radioButtons("inclusivity", "Operator to combine statistics",choices = 
+    c("And","Or")),downloadButton('downloadRemoved', "Save selected outlier points"))),
+  
+  # Choices for possible statistics and parameter. If the outside x units from previous statistic is chosen, 
+  # another conditional panel pops up asking for a number of units
+  fluidRow(column(4, multiInput( 
+    inputId = "stat_choice", label = "Statistic for flagging potential outliers:", 
+    choices =c("Outside 99th percentile", "Outside 3 standard deviations", 
+        "Outside 1.5xIQR", "Outside X units from previous")), uiOutput("inputparam")),  # If Outside 
+    #X units of previous is chosen, pop up a conditional panel asking for the amount
+  conditionalPanel(
+      condition = 
+        "input.stat_choice.indexOf('Outside X units from previous') != -1",
+      numericInput(inputId = "max_gap", label = "X = ", value = 0, step = 0.001, width = '50%')), 
+      column(8, DTOutput("table"))),
+  
+  # Tabs for individual plots (defined in the shiny server), table2 (points selected as potential outliers)
+  # and input sites selected for definition
+  fluidRow(
+  column(8, tabsetPanel(type = "tabs",
+    tabPanel("Line Graph", plotlyOutput(outputId = "plot1")),
+    tabPanel("Box Plot", plotlyOutput("plot2")),
+    tabPanel("Editable Data", DTOutput("table_edits")))
+ ), column(4, uiOutput("inputsites"),
+  tableOutput('table2'))
+))
+
+server <- function(input, output, session) {
+  # Initialize reactive dataset of awqms data; initializes once the retrieve button is pushed
+  aqfr_data_raw = reactive({
+    req(input$retrieve)
+    selected_sites = subset(sites,  # Make a subset of sites that will be used in the awqms data request
+        WatershedManagementUnit == input$selected_aqfr)$MonitoringLocationIdentifier
+    if(length(grep("test|Test", selected_sites)) != 0){
+      selected_sites = selected_sites[-grep("test|Test", selected_sites)]  # Remove any test wells 
+    }
+    
+    # Make the web request (subsetted for aquifer and parameters)
+    GW <- readOKAWQMS(type="results", Characteristic = params, 
+      MonitoringLocationIdentifiersCsv = selected_sites)
+    
+    # Join the request to the site data to pull in aquifer
+    all_data = left_join(GW, sites)
+    
+    all_data$StartDate = ymd(all_data$StartDate)
+    
+    data = all_data
+  })
+  aqfr_data = reactive({
+    # Perform general formatting/processing
+    proc_data = awqms_process_calc(aqfr_data_raw())
+    # Fix data formats
+    proc_data$ResultValue = as.numeric(proc_data$ResultValue)
+    proc_data$ActivityStartDate = ymd(proc_data$ActivityStartDate)
+    proc_data$WellID = as.character(proc_data$WellID)
+    # Select only pertinent variables and remove NA's
+    data_trim = na.omit(proc_data %>% select(WellID, ActivityStartDate, CharacteristicName, 
+          DetectionCondition,ResultValue, ResultUnit))
+
+    data_trim$flagged = rep("No", nrow(data_trim))  # Make a flagged vector to be modified in app
+    
+    data = data_trim  # Set the output of the reactive data to the previous dataset
+  })
+  new_raw_data = reactive({
+    # Retrieve and combine field and lab data
+    req(input$retrieve)
+    if(input$qa_type == "New data for import"){
+    # Retrieve and combine all lab data files based on user-input file paths
+    for(j in 1:nrow(input$lab_data)){
+      a = read.csv(input$lab_data[[j, 'datapath']], sep = ",", fill = TRUE)
+      if(j == 1) all_lab_data = a else all_lab_data = rbind(all_lab_data, a)
+    }
+    for(j in 1:nrow(input$field_data)){
+      # Retrieve and combine all field data files based on user-input file paths
+      a = read.csv(input$field_data[[j, 'datapath']], sep = ",", fill = TRUE)
+      if(j == 1) all_field_data = a else all_field_data = rbind(all_field_data, a)
+    }
+    # Adjust column names for consistency  
+    colnames(all_field_data)[which(colnames(all_field_data) == "Well.ID")] = "WellID"
+    colnames(all_field_data)[which(colnames(all_field_data) == "Date")] = "ActivityStartDate"
+    
+    # Fix date column, survey date-time column only has correct date
+    all_field_data$ActivityStartDate = ymd_hm(paste(mdy(sub('(?<=\\ ).*$', '',
+          all_field_data$ActivityStartDate, perl=TRUE)), all_field_data$Sample.Time))
+    
+    # Get necessary parameters from field data and fix formatting, merge sample time with date
+    field_data_sub = all_field_data %>% select(ActivityStartDate, Sample.Time, WellID, 
+        Water.Level, Temperature,Specific.Conductivity, D.O., pH, Wind.Direction, Wind.Speed,
+        Pressure, Air.Temperature, X..Cloud.Cover,
+        ORP,Total.Alkalinity,Hardness)%>% gather(key = "CharacteristicName", 
+        value = "ResultValue", -ActivityStartDate,-Sample.Time, -WellID)
+
+    
+    # Remove sample time as a variable (since it is lumped in with date)   
+    field_data_sub = field_data_sub %>% select(-Sample.Time)
+    
+    # Rename parameters to match awqms names
+    
+    field_data_sub$CharacteristicName[which(field_data_sub$CharacteristicName ==
+      "Water.Level")] = "Depth, from ground surface to well water level"
+    field_data_sub$CharacteristicName[which(field_data_sub$CharacteristicName ==
+      "Temperature")] ="Temperature, water"
+    field_data_sub$CharacteristicName[which(field_data_sub$CharacteristicName ==
+      "Specific.Conductivity")] = "Specific conductance"
+    field_data_sub$CharacteristicName[which(field_data_sub$CharacteristicName == 
+      "D.O.")] = "Dissolved oxygen (DO)"
+    field_data_sub$CharacteristicName[which(field_data_sub$CharacteristicName ==
+      "Total.Alkalinity")] = "Alkalinity, total"
+    field_data_sub$CharacteristicName[which(field_data_sub$CharacteristicName == "Hardness")] =
+      "Total hardness"
+    field_data_sub$CharacteristicName[which(field_data_sub$CharacteristicName == "ORP")] =
+      "Oxidation reduction potential (ORP)"
+    
+    # Make a unit key from awqms (since it is not included in lab reports)
+    units = unique(select(aqfr_data(), CharacteristicName, ResultUnit))
+    
+    # Make a detection condition column for field data for column binding, bind columns
+    field_data_sub$DetectionCondition = rep("", nrow(field_data_sub))
+    field_data_sub = left_join(field_data_sub, units) %>% relocate(DetectionCondition, 
+        .before = ResultValue)
+    
+    # Replace "dissolved" in the lab data with nothing for all parameters but TDS
+    # (dissolved is assumed). FIx other names as well
+    dont_replace = which(all_lab_data$COMPONENT == "Total Dissolved Solids")
+    
+    all_lab_data$COMPONENT[-dont_replace] = gsub("Dissolved ",
+      "",all_lab_data$COMPONENT[-dont_replace])
+    all_lab_data$COMPONENT[-dont_replace] = gsub(", dissolved",
+      "",all_lab_data$COMPONENT[-dont_replace])
+    all_lab_data$COMPONENT[-dont_replace] = gsub(", Dissolved",
+      "",all_lab_data$COMPONENT[-dont_replace])
+    all_lab_data$COMPONENT = gsub("Nitrogen", "N",all_lab_data$COMPONENT)
+    all_lab_data$COMPONENT[which(all_lab_data$COMPONENT == "Nitrate/Nitrite as N")] =
+      "Nitrate and nitrite as N"
+    
+    # Reformat, select columns, add blank column for detection condition (to be filled in later)
+    all_lab_data$ActivityStartDate = mdy_hm(all_lab_data$SAMPLED_DATE)
+    all_lab_data$DetectionCondition = rep("", nrow(all_lab_data))
+    all_lab_data$WellID = all_lab_data$SP_DESCRIPTION
+    all_lab_data$CharacteristicName = all_lab_data$COMPONENT
+    lab_data_sub = all_lab_data %>% select(ActivityStartDate, WellID,
+        CharacteristicName, DetectionCondition, RESULT, UNITS)
+    colnames(lab_data_sub) = c("ActivityStartDate",
+      "WellID", "CharacteristicName", "DetectionCondition","ResultValue", "ResultUnit")
+    colnames(field_data_sub) = c("ActivityStartDate",
+      "WellID", "CharacteristicName", "DetectionCondition","ResultValue", "ResultUnit")
+    
+    # Fill in lab data detection condition column  based on < symbols in results column
+    lab_data_sub$DetectionCondition[which(grepl("<", lab_data_sub$ResultValue))] = "<"
+    # Remove < symbol from results
+    lab_data_sub$ResultValue[which(grepl("<", lab_data_sub$ResultValue))] = 
+      as.numeric(gsub("<", "", 
+      lab_data_sub$ResultValue[which(grepl("<", lab_data_sub$ResultValue))]))
+    
+    # Rbind fomatted field and lab data
+    all_new_data = rbind(lab_data_sub, field_data_sub)
+    # Join all lab data to the combined subset, except for repeat fields. Combining keys are WellID, date, 
+    # and CharacteristicName
+    all_new_data = left_join(all_new_data, all_lab_data %>% select(-SAMPLED_DATE, -DetectionCondition,
+        -SP_DESCRIPTION,-COMPONENT,-RESULT, -UNITS ))
+    # Join all field data to the combined subset, Combining keys are wellID and date
+    all_new_data = left_join(all_new_data, all_field_data %>% select(-ObjectID, -GlobalID, -Time,
+        -Water.Level, -Temperature,-Specific.Conductivity, -D.O., -pH,-Wind.Direction, -Wind.Speed,
+        -Pressure, -Air.Temperature, -X..Cloud.Cover,
+        -ORP,-Total.Alkalinity,-Hardness))
+    data = all_new_data
+    } else data = NULL
+  })
+  
+  aqfr_stats = reactive({
+    # Make a my_skim function to get the outside 1% range of data
+    req(input$retrieve)
+    my_skim = skim_with(
+      numeric = sfl(p0.5 = ~ quantile(., probs = 0.005), 
+      p99.5 = ~quantile(., probs = 0.995)), append = TRUE)
+
+    # Perform the calculation on every characteristic
+    stats = aqfr_data() %>% group_by(CharacteristicName) %>%
+      my_skim(ResultValue)
+
+    # Make an upper and lower limit for the IQR stat method
+    stats$upper_lim = stats$numeric.p75 +
+        1.5*(stats$numeric.p75-stats$numeric.p25)
+      stats$lower_lim = stats$numeric.p25 -
+        1.5*(stats$numeric.p75-stats$numeric.p25)
+    
+    # If new data for inport is selected, read in lab data and survey data  
+    if(input$qa_type == "New data for import"){
+      new_data = new_raw_data() %>% select(
+      ActivityStartDate,WellID, CharacteristicName, DetectionCondition,ResultValue, ResultUnit)
+      # Join data to QA (either new data or awqms data based on user choice) to stat data
+      gwlevel_join = left_join(new_data,stats)
+    } else {
+      gwlevel_join = left_join(aqfr_data(),stats)
+    } 
+    # Make results numeric
+    gwlevel_join$ResultValue = as.numeric(gwlevel_join$ResultValue)
+
+    # Obtain points outside the interquartile range
+    potential_outliers = which(gwlevel_join$ResultValue <
+        gwlevel_join$lower_lim | gwlevel_join$ResultValue >
+        gwlevel_join$upper_lim)
+
+    # Make a column indicating points outside the IQR limit
+    gwlevel_join$IQR_outliers = rep("No", nrow(gwlevel_join))
+      gwlevel_join$IQR_outliers[potential_outliers] = "Yes"
+
+    # Obtain points outside the 99% confidence interval
+    potential_outliers = which(gwlevel_join$ResultValue <
+          gwlevel_join$numeric.p0.5|gwlevel_join$ResultValue >
+          gwlevel_join$numeric.p99.5)
+
+    # Make a column indicating points outside the 99% limit
+    gwlevel_join$Perc_99_outliers = rep("No", nrow(gwlevel_join))
+       gwlevel_join$Perc_99_outliers[potential_outliers] = "Yes"
+
+    # Obtain points outside 3 standard deviations of the mean
+    gwlevel_join$z_scores = (gwlevel_join$ResultValue -
+      gwlevel_join$numeric.mean)/gwlevel_join$numeric.sd
+    potential_outliers = which(gwlevel_join$z_scores > 3 | gwlevel_join$z_scores < -3)
+
+    # Make a column indicating points outside the z-score limit
+    gwlevel_join$z_outliers = rep("No", nrow(gwlevel_join))
+    gwlevel_join$z_outliers[potential_outliers] = "Yes"
+
+
+    # Make an empty vector for the measurement change
+    gwlevel_join$meas_change = rep(NA, nrow(gwlevel_join))
+
+    # For each site, calculate the most recent change in parameter measurement
+    for(i in 1:nrow(gwlevel_join)){
+      # Subset to only look at a single site and parameter, and the most recent measurement of said parameter
+      # before the initial value to be QA'd
+      single_param = subset(aqfr_data(), WellID == gwlevel_join$WellID[i] & 
+            CharacteristicName == gwlevel_join$CharacteristicName[i] & 
+              ActivityStartDate < gwlevel_join$ActivityStartDate)
+      if(nrow(single_param) >= 1){
+        single_param = subset(single_param, ActivityStartDate ==
+          max(single_param$ActivityStartDate))
+        # If a current and most recent past measurement both exist, take the change in parameter as the
+        # difference from one to the next
+        current_meas = gwlevel_join$ResultValue[i]
+        if(!is.na(current_meas) & !is.na(single_param$ResultValue)){
+          gwlevel_join$meas_change[i] = current_meas - single_param$ResultValue
+        # If one or both values are missing, put the change as 0
+        } else gwlevel_join$meas_change[i] = 0
+      } else gwlevel_join$meas_change[i] = 0
+    }
+
+    # Make a user_remove vector for later
+    gwlevel_join$user_remove = rep("No", nrow(gwlevel_join))
+
+    gwlevel_join$WellID = as.character(gwlevel_join$WellID)
+    
+    data = gwlevel_join
+  })
+  
+  
+  #Make a reactive data set based on user stat choices
+  new_data = reactive({
+    
+    gwlev_processed = aqfr_stats()
+    
+    gwlev_processed$flagged = rep("No", nrow(gwlev_processed))
+      
+    # Select columns corresponding to flagged measurements from the original data set based on user stat choice
+      if("Outside 99th percentile" %in% input$stat_choice){
+        c1 = select(gwlev_processed,Perc_99_outliers)
+      } else c1 = rep(NA, nrow(gwlev_processed))
+      if("Outside 1.5xIQR" %in% input$stat_choice){
+        c2 = select(gwlev_processed, IQR_outliers)
+      } else c2 = rep(NA, nrow(gwlev_processed))
+      if("Outside 3 standard deviations" %in% input$stat_choice){
+        c3 = select(gwlev_processed, z_outliers)
+      } else c3 = rep(NA, nrow(gwlev_processed))
+      if("Outside X units from previous" %in% input$stat_choice){
+        gwlev_processed$meas_change = as.numeric(gwlev_processed$meas_change)
+        # Get an index of rows that exceed the user input for max water level difference in 
+        # the most recent measurements 
+        r_id_exceeds = which(gwlev_processed$meas_change > input$max_gap | 
+                gwlev_processed$meas_change < input$max_gap * -1)
+        gwlev_processed$range_outliers = rep("No", nrow(gwlev_processed))
+        gwlev_processed$range_outliers[r_id_exceeds] = "Yes"
+        c4 = select(gwlev_processed, range_outliers)
+      } else c4 = rep(NA, nrow(gwlev_processed))
+    
+      flag_df = cbind(c1,c2,c3,c4) # Build a data frame of flagged/non-flagged rows 
+      
+      flag_df$r_id = seq(1:nrow(flag_df)) # Name the rows
+      
+      flag_df <- flag_df[ , colSums(is.na(flag_df)) < nrow(flag_df)]
+    
+
+      if(input$inclusivity == "And"){
+      
+       # Select rows were all of the columns have a value of "Yes"
+        if(ncol(flag_df) == 2){  
+          flag_ind = flag_df[which(flag_df[,1] == "Yes"),]$r_id
+        } else if(ncol(flag_df) == 3){  
+          flag_ind = flag_df[which(flag_df[,1] == "Yes" & 
+          flag_df[,2] == "Yes"),]$r_id
+        }else if(ncol(flag_df) == 4){
+          flag_ind = flag_df[which(flag_df[,1] == "Yes" & 
+          flag_df[,2] == "Yes" & flag_df[,3] == "Yes"),]$r_id
+        }else if(ncol(flag_df) == 5){
+          flag_ind = flag_df[which(flag_df[,1] == "Yes" & 
+          flag_df[,2] == "Yes" & flag_df[,3] == "Yes" & flag_df[,4]) == "Yes",]$r_id
+        }
+      }else if(input$inclusivity == "Or"){
+      
+        # Select rows where at least one of the columns has a value of "Yes"
+        if(ncol(flag_df) == 2){
+          flag_ind = flag_df[which(flag_df[,1] == "Yes"),]$r_id
+        } else if(ncol(flag_df) == 3){
+          flag_ind = flag_df[which(flag_df[,1] == "Yes" | 
+          flag_df[,2] == "Yes"),]$r_id
+        }else if(ncol(flag_df) == 4){
+          flag_ind = flag_df[which(flag_df[,1] == "Yes" | 
+          flag_df[,2] == "Yes" | flag_df[,3] == "Yes"),]$r_id
+        }else if(ncol(flag_df) == 5){
+          flag_ind = flag_df[which(flag_df[,1] == "Yes" | 
+          flag_df[,2] == "Yes" | flag_df[,3] == "Yes" | flag_df[,4]) == "Yes",]$r_id
+          }
+        } else flag_ind = NULL
+      gwlev_processed$flagged[flag_ind] = "Yes"  # Changed the value of flagged for the applicable rows
+      # Only consider those rows which involve a flagged parameter. 
+      flag_params = unique(subset(gwlev_processed, flagged == "Yes")$CharacteristicName)  
+      data = subset(gwlev_processed, CharacteristicName %in% flag_params)
+    })
+  
+  # Make a reactive user input called flagged params based on the flagged params from user options
+  output$inputparam <- renderUI({
+    selectInput(
+      inputId = "param",
+      label = "Flagged Parameter",
+      choices = unique(new_data()$CharacteristicName))
+    })
+  # Make a reactive user input to choose a flagged site according to the chosen parameter
+  output$inputsites = renderUI({
+    selectInput(
+      inputId = "site_no",
+      label = "Site(s):",
+      choices = unique(subset(new_data(), CharacteristicName == input$param & flagged == "Yes")$WellID),
+    )
+  })
+
+  # Make another reactive dataset for plot data including flagged and non-flagged measurements 
+  # for user-selected site
+  plot_data = reactive({
+    
+    all_flagged = new_data() %>% 
+      select(WellID,ActivityStartDate, CharacteristicName,ResultValue, flagged) %>%
+      filter(CharacteristicName == input$param)
+    
+    if(input$qa_type == "New data for import"){
+      data_trim = na.omit(aqfr_data()) %>% filter(CharacteristicName == input$param) %>%
+        select(WellID,ActivityStartDate, CharacteristicName,ResultValue, flagged)
+
+      data_trim$flagged = rep("No", nrow(data_trim))
+    
+      data = rbind(data_trim, all_flagged)
+    } else data = all_flagged
+  })
+  # Make a chart data set for only including flagged measurements which can be selected/removed
+  # Table can include selected site or all possible sites. 
+  chart_data = reactive({
+    a = new_data()
+    a$ResultValue = paste(a$DetectionCondition, a$ResultValue, a$ResultUnit)
+    a = subset(a, flagged == "Yes") %>% 
+      select(WellID, CharacteristicName, ActivityStartDate, ResultValue) %>% 
+      filter(CharacteristicName == input$param)
+    data = a
+  })
+  
+  # Save identified outliers, this function also checks to see if the file exists and if it does, appends new
+  # flagged outliers
+  user_removed = reactive({
+      ids = input$table_rows_selected
+      remove_df = chart_data()[ids,]
+      if(file.exists("QA_flagged.csv")){
+        prior_removed = read.csv("QA_flagged.csv")
+        unlink("QA_flagged.csv")
+      } else { prior_removed = remove_df}
+      
+      data = unique(rbind(remove_df, prior_removed))
+  })
+
+  # Make plotly line graph with two layers: one for flagged data and one for unflagged. 
+  output$plot1 = renderPlotly({
+      plot_data = subset(plot_data(), WellID == input$site_no)
+      flag_data = subset(plot_data, flagged == "Yes")
+      ymin = min(plot_data$ResultValue)*0.7
+      ymax = max(plot_data$ResultValue)*1.3
+      
+      p = plot_ly(plot_data, x = ~ActivityStartDate) %>%
+        add_trace(y = ~ResultValue, 
+          type = 'scatter', mode = 'lines + markers', 
+          name = "non-flagged") %>% 
+        add_trace(x = flag_data$ActivityStartDate, type = 'scatter',
+          y = flag_data$ResultValue,
+          mode = 'markers', name = "flagged") %>%
+      layout(yaxis = list(range = c(ymax,ymin)))
+      p
+  })
+  # Make another plotly plot, this one a box plot for all aquifer data with a scatter plot adjacent
+  output$plot2 = renderPlotly({
+      plot_data = plot_data()
+      flag_index = which(plot_data$flagged == "Yes")
+      ymin = min(plot_data$ResultValue)*0.9
+      ymax = max(plot_data$ResultValue)*1.1
+      
+      plot_data$x = rnorm(nrow(plot_data),2, 0.3) # Randomly generate the x variable for the scatter plot
+      
+      # Generate scatterplot with flagged values colored
+      p1 <- plot_ly(plot_data, y = ~ResultValue, x=~x) %>%
+        add_markers(color=~flagged) %>% layout(xaxis = list(
+          zeroline = FALSE,showline = FALSE,showticklabels = FALSE,showgrid = FALSE, 
+          title = ""))
+      # Generate boxplot
+      p2 <- plot_ly(plot_data, y = ~ResultValue) %>%
+        add_boxplot(name = ~"boxplot") %>% layout(margin = list(r = 0, l = 0, t = 20, b = 20))
+      p <- subplot(p1, p2, shareY = TRUE, widths = c(0.5, 0.5), margin = 0)
+      p  # Output plot
+      
+      #p = plot_ly(plot_data, y = ~ResultValue, type = "box", boxpoints = "all", jitter = 0.3,
+        #pointpos = -1.8, selectedpoints = flag_index) %>% 
+      #layout(yaxis = list(range = c(ymax,ymin)))
+      #p
+  })
+  # Render data table of flagged potential outliers
+  output$table = renderDT({
+    datatable(chart_data())
+  })
+  # Make data table of selected actual outliers
+  output$table2 = renderTable({
+    a = chart_data()
+    ids = input$table_rows_selected
+    a[ids,]
+  })
+  output$table_edits = renderDT(server = FALSE, {
+    # Make a table of editable data, either the aqwms data being removed or the new awqms data for inport
+    if(input$qa_type == "AWQMS data only"){
+      tbl = aqfr_data_raw()
+      # Define columns to hide, necessary to maintain table usability
+      hide_ids = which(colnames(tbl) != "MonitoringLocationIdentifier" & 
+        colnames(tbl) != "CharacteristicName" & colnames(tbl) != "StartDate" &
+        colnames(tbl) != "ResultValue" &
+        colnames(tbl) != "ResultUnit" & colnames(tbl) != "Comments") -1
+    } else{
+        tbl = new_raw_data()
+        # Define columns to hide, necessary to maintain table usability
+        hide_ids = which(colnames(tbl) != "WellID" & 
+        colnames(tbl) != "CharacteristicName" & colnames(tbl) != "ActivityStartDate" &
+        colnames(tbl) != "ResultValue" & colnames(tbl) != "DetectionCondition" &
+        colnames(tbl) != "ResultUnit" & colnames(tbl) != "RESULT_NOTES") -1
+        colnames(tbl)[which(colnames(tbl) == "DetectionCondition")] = ""
+    }
+    # Generate the datatable
+    datatable(tbl,
+      editable = TRUE, rownames = NULL,  extensions = 'Buttons',
+        options = list(paging = TRUE,
+        scrollX=TRUE, 
+        searching = TRUE,
+        ordering = TRUE,
+        columnDefs = list(list(visible=FALSE, targets=hide_ids)),
+        dom = 'Bfrtip', buttons = 'csv'
+        ))
+  })
+# Download/save outliers to the existing file
+  output$downloadRemoved = downloadHandler(
+    filename = function() {
+      paste0(getwd(),"/QA_flagged.csv")
+    },
+    content = function(file) {
+      write.csv(unique(user_removed()), file, row.names = FALSE)
+      #write.csv(download_values$a, file, row.names = FALSE)
+    }
+  )
+
+}
+
+shinyApp(ui = ui, server = server, options = list(height = 900, width = "100%"))
+```
+
+
+
+
+
